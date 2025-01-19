@@ -19,6 +19,130 @@ from datetime import datetime
 # [Previous DoubleConv, UNet, and Dataset classes remain the same]
 
 
+def collate_fn(batch):
+    batch = list(filter(lambda x: x is not None, batch))
+    return torch.utils.data.dataloader.default_collate(batch)
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class UNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # Encoder
+        self.conv1 = DoubleConv(3, 64)
+        self.conv2 = DoubleConv(64, 128)
+        self.conv3 = DoubleConv(128, 256)
+        self.conv4 = DoubleConv(256, 512)
+
+        # Pooling
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Decoder
+        self.upsample = nn.Upsample(
+            scale_factor=2, mode='bilinear', align_corners=True)
+        self.up_conv3 = DoubleConv(512 + 256, 256)
+        self.up_conv2 = DoubleConv(256 + 128, 128)
+        self.up_conv1 = DoubleConv(128 + 64, 64)
+
+        # Final conv
+        self.final_conv = nn.Conv2d(64, 1, kernel_size=1)
+
+    def center_crop(self, layer, target_size):
+        _, _, layer_height, layer_width = layer.size()
+        diff_y = (layer_height - target_size[0]) // 2
+        diff_x = (layer_width - target_size[1]) // 2
+        return layer[:, :, diff_y:(diff_y + target_size[0]), diff_x:(diff_x + target_size[1])]
+
+    def forward(self, x):
+        # Encoding path
+        conv1 = self.conv1(x)      # 50x50x64
+        pool1 = self.pool(conv1)   # 25x25x64
+
+        conv2 = self.conv2(pool1)  # 25x25x128
+        pool2 = self.pool(conv2)   # 12x12x128
+
+        conv3 = self.conv3(pool2)  # 12x12x256
+        pool3 = self.pool(conv3)   # 6x6x256
+
+        conv4 = self.conv4(pool3)  # 6x6x512
+
+        # Decoding path
+        up3 = self.upsample(conv4)                # 12x12x512
+        up3 = torch.cat([up3, conv3], dim=1)      # 12x12x(512+256)
+        up_conv3 = self.up_conv3(up3)             # 12x12x256
+
+        up2 = self.upsample(up_conv3)             # 24x24x256
+        up2 = torch.cat([up2, conv2], dim=1)      # 24x24x(256+128)
+        up_conv2 = self.up_conv2(up2)             # 24x24x128
+
+        up1 = self.upsample(up_conv2)             # 48x48x128
+        up1 = torch.cat([up1, conv1], dim=1)      # 48x48x(128+64)
+        up_conv1 = self.up_conv1(up1)             # 48x48x64
+
+        out = self.final_conv(up_conv1)           # 48x48x1
+
+        return torch.sigmoid(out)
+
+
+class IDCDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.images = []
+        self.labels = []
+
+        # Load non-IDC images (class 0)
+        class0_path = os.path.join(root_dir, '0')
+        for img_name in os.listdir(class0_path):
+            if img_name.endswith(('.png', '.jpg', '.jpeg')):
+                self.images.append(os.path.join(class0_path, img_name))
+                self.labels.append(0)
+
+        # Load IDC images (class 1)
+        class1_path = os.path.join(root_dir, '1')
+        for img_name in os.listdir(class1_path):
+            if img_name.endswith(('.png', '.jpg', '.jpeg')):
+                self.images.append(os.path.join(class1_path, img_name))
+                self.labels.append(1)
+
+        print(f"Loaded {len(self.labels)} images")
+        print(f"Class 0 (non-IDC): {self.labels.count(0)} images")
+        print(f"Class 1 (IDC): {self.labels.count(1)} images")
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        try:
+            image_path = self.images[idx]
+            image = Image.open(image_path).convert('RGB')
+            label = self.labels[idx]
+
+            if self.transform:
+                image = self.transform(image)
+
+            return image, torch.tensor(label, dtype=torch.float32)
+        except Exception as e:
+            print(f"Error loading image {image_path}: {str(e)}")
+            return None
+
+
 def save_model_summary(model, input_size=(1, 3, 48, 48)):
     """Save model summary to a text file"""
     with open('model_summary.txt', 'w') as f:
