@@ -145,9 +145,18 @@ class IDCDataset(Dataset):
 
 def save_model_summary(model, input_size=(1, 3, 48, 48)):
     """Save model summary to a text file"""
-    with open('model_summary.txt', 'w') as f:
-        model_summary = summary(model, input_size=input_size, verbose=0)
-        print(model_summary, file=f)
+    try:
+        # Create directory if it doesn't exist
+        os.makedirs('metrics', exist_ok=True)
+
+        # Open file with UTF-8 encoding
+        with open(os.path.join('metrics', 'model_summary.txt'), 'w', encoding='utf-8') as f:
+            model_summary = summary(model, input_size=input_size, verbose=0)
+            print(model_summary, file=f)
+    except Exception as e:
+        print(f"Warning: Could not save model summary: {str(e)}")
+        # Continue execution even if summary saving fails
+        pass
 
 
 def plot_confusion_matrix(cm, classes, epoch, save_dir='plots'):
@@ -167,39 +176,72 @@ def plot_training_metrics(metrics_df, save_dir='plots'):
     """Plot training metrics"""
     os.makedirs(save_dir, exist_ok=True)
 
-    # Plot losses
+    # Convert metrics list to DataFrame if it's not already
+    if not isinstance(metrics_df, pd.DataFrame):
+        metrics_df = pd.DataFrame(metrics_df)
+
+    # Plot training progress (Loss)
     plt.figure(figsize=(10, 6))
-    plt.plot(metrics_df['epoch'], metrics_df['train_loss'],
-             label='Training Loss')
-    plt.plot(metrics_df['epoch'], metrics_df['val_loss'],
-             label='Validation Loss')
+    epochs = range(1, len(metrics_df) + 1)  # Create epoch numbers
+    plt.plot(epochs, metrics_df['train_loss'], 'b-', label='Training Loss')
+    plt.plot(epochs, metrics_df['val_loss'], 'r-', label='Validation Loss')
     plt.title('Training and Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
+    plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'loss_plot.png'))
     plt.close()
 
     # Plot F1 Score
     plt.figure(figsize=(10, 6))
-    plt.plot(metrics_df['epoch'], metrics_df['f1_score'])
+    plt.plot(epochs, metrics_df['f1_score'], 'g-')
     plt.title('F1 Score Over Time')
     plt.xlabel('Epoch')
     plt.ylabel('F1 Score')
+    plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'f1_score_plot.png'))
     plt.close()
+
+    # Plot Accuracy, Precision, and Recall
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, metrics_df['accuracy'], 'b-', label='Accuracy')
+    plt.plot(epochs, metrics_df['precision'], 'r-', label='Precision')
+    plt.plot(epochs, metrics_df['recall'], 'g-', label='Recall')
+    plt.title('Model Metrics Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'metrics_plot.png'))
+    plt.close()
+
+    # Plot Learning Rate
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, metrics_df['learning_rate'], 'b-')
+    plt.title('Learning Rate Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'learning_rate_plot.png'))
+    plt.close()
+
+    # Save numerical metrics to CSV
+    metrics_df.to_csv(os.path.join(
+        save_dir, 'training_metrics.csv'), index=False)
 
 
 def initialize_metrics_csv():
     """Initialize CSV file for tracking metrics"""
-    filename = f'training_metrics_{
-        datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    os.makedirs('metrics', exist_ok=True)
+    filename = os.path.join('metrics',
+                            f'training_metrics_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
     headers = ['epoch', 'train_loss', 'val_loss', 'accuracy', 'precision',
                'recall', 'f1_score', 'learning_rate', 'epoch_time',
                'true_positives', 'false_positives', 'true_negatives',
                'false_negatives']
 
-    with open(filename, 'w', newline='') as f:
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(headers)
     return filename
@@ -212,8 +254,11 @@ def validate_model(model, val_loader, criterion, device):
     all_preds = []
     all_labels = []
 
+    # Add progress bar for validation
+    val_progress = tqdm(val_loader, desc='Validating', leave=False)
+
     with torch.no_grad():
-        for inputs, labels in val_loader:
+        for inputs, labels in val_progress:
             inputs = inputs.to(device)
             labels = labels.to(device).view(-1, 1, 1, 1)
             outputs = model(inputs)
@@ -222,11 +267,22 @@ def validate_model(model, val_loader, criterion, device):
             loss = criterion(outputs, target)
             val_loss += loss.item()
 
-            predictions = (outputs.mean(dim=(2, 3)) > 0.5).float()
-            all_preds.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            # Convert predictions to binary (0 or 1)
+            predictions = (outputs.mean(dim=(2, 3)) > 0.5).float().view(-1)
+            labels = labels.view(-1)
 
-    return val_loss / len(val_loader), np.array(all_preds), np.array(all_labels)
+            # Convert to numpy arrays and ensure binary format
+            all_preds.extend(predictions.cpu().numpy().astype(int))
+            all_labels.extend(labels.cpu().numpy().astype(int))
+
+            # Update progress bar with loss
+            val_progress.set_postfix({'val_loss': f'{loss.item():.4f}'})
+
+    # Convert lists to numpy arrays and ensure binary format
+    all_preds = np.array(all_preds, dtype=int)
+    all_labels = np.array(all_labels, dtype=int)
+
+    return val_loss / len(val_loader), all_preds, all_labels
 
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, device, num_epochs=10):
@@ -240,7 +296,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, n
     print("\n=== Starting Training ===")
     print(f"Training on device: {device}")
     print(f"Metrics will be saved to: {metrics_filename}")
-
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
@@ -264,9 +319,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, n
             optimizer.step()
 
             running_loss += loss.item()
-            predictions = (outputs.mean(dim=(2, 3)) > 0.5).float()
-            all_preds.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            # Convert predictions to binary format
+            predictions = (outputs.mean(dim=(2, 3)) > 0.5).float().view(-1)
+            labels = labels.view(-1)
+
+            all_preds.extend(predictions.cpu().numpy().astype(int))
+            all_labels.extend(labels.cpu().numpy().astype(int))
 
             progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
 
@@ -278,18 +336,23 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, n
         train_loss = running_loss / len(train_loader)
         epoch_time = time.time() - epoch_start_time
 
-        # Calculate confusion matrix and derived metrics
-        cm = confusion_matrix(val_labels, val_preds)
-        tn, fp, fn, tp = cm.ravel()
+        # Ensure binary format for confusion matrix
+        val_preds = val_preds.astype(int)
+        val_labels = val_labels.astype(int)
 
-        accuracy = (tp + tn) / (tp + tn + fp + fn)
-        precision = precision_score(val_labels, val_preds, zero_division=0)
-        recall = recall_score(val_labels, val_preds, zero_division=0)
-        f1 = f1_score(val_labels, val_preds, zero_division=0)
+        try:
+            cm = confusion_matrix(val_labels, val_preds)
+            tn, fp, fn, tp = cm.ravel()
 
-        # Save metrics to CSV
+            accuracy = (tp + tn) / (tp + tn + fp + fn)
+            precision = precision_score(val_labels, val_preds, zero_division=0)
+            recall = recall_score(val_labels, val_preds, zero_division=0)
+            f1 = f1_score(val_labels, val_preds, zero_division=0)
+        except Exception as e:
+            print(f"Error calculating metrics: {str(e)}")
+            continue
+
         metrics = {
-            'epoch': epoch + 1,
             'train_loss': train_loss,
             'val_loss': val_loss,
             'accuracy': accuracy,
@@ -303,33 +366,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, n
             'true_negatives': tn,
             'false_negatives': fn
         }
-
         metrics_list.append(metrics)
 
-        with open(metrics_filename, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([metrics[key] for key in metrics.keys()])
-
-        # Plot confusion matrix
-        plot_confusion_matrix(cm, ['Non-IDC', 'IDC'], epoch + 1)
-
-        # Save checkpoint if best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_val_loss,
-                'metrics': metrics
-            }, 'best_model.pth')
-
-        print(f'\nEpoch {epoch+1} Summary:')
-        print(f'Training Loss: {train_loss:.4f}')
-        print(f'Validation Loss: {val_loss:.4f}')
-        print(f'F1 Score: {f1:.4f}')
-        print(f'Accuracy: {accuracy:.4f}')
-        print(f'Time: {epoch_time:.2f} seconds')
+    # Convert metrics list to DataFrame and plot
+    metrics_df = pd.DataFrame(metrics_list)
+    plot_training_metrics(metrics_df)
 
     # Plot final training metrics
     metrics_df = pd.DataFrame(metrics_list)
