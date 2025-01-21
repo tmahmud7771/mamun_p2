@@ -363,8 +363,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, n
                 writer.writerow([epoch + 1] + [metrics[key]
                                 for key in metrics.keys()])
 
-            # Plot confusion matrix
-            plot_confusion_matrix(cm, ['Non-IDC', 'IDC'], epoch + 1)
+            # # Plot confusion matrix
+            # plot_confusion_matrix(cm, ['Non-IDC', 'IDC'], epoch + 1)
 
             # Print epoch summary
             print(f'\nEpoch {epoch+1} Summary:')
@@ -380,7 +380,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, n
 
     # Plot final training metrics
     metrics_df = pd.DataFrame(metrics_list)
-    plot_training_metrics(metrics_df)
+    # plot_training_metrics(metrics_df)
 
     return metrics_df
 
@@ -444,8 +444,8 @@ def main():
                              optimizer, device, NUM_EPOCHS)
 
     # Save final model and metrics
-    torch.save(model.state_dict(), 'final_model.pth')
-    metrics_df.to_csv('final_metrics.csv', index=False)
+    torch.save(model.state_dict(), 'final_model_resnet.pth')
+    metrics_df.to_csv('final_metrics_resnet.csv', index=False)
     print("Training completed. Model and metrics saved.")
 
 
