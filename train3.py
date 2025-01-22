@@ -18,24 +18,32 @@ from torchinfo import summary
 import pandas as pd
 import os
 
+
 class CLIPClassifier(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
         self.clip_model = clip_model
         self.classifier = nn.Linear(clip_model.visual.output_dim, 2)
-        
+
         # Freeze CLIP parameters
         for param in self.clip_model.parameters():
             param.requires_grad = False
-        
-        # Only train the classifier head
-        for param in self.classifier.parameters():
-            param.requires_grad = True
-            
+
+        # Initialize classifier in the same dtype as CLIP
+        self.classifier = self.classifier.half()
+
     def forward(self, image):
-        image_features = self.clip_model.encode_image(image)
-        output = self.classifier(image_features)
-        return output
+        # Ensure input is in float16
+        if image.dtype != torch.float16:
+            image = image.half()
+
+        with torch.cuda.amp.autocast():
+            image_features = self.clip_model.encode_image(image)
+            output = self.classifier(image_features)
+
+        # Convert back to float32 for loss computation
+        return output.float()
+
 
 class IDCDatasetCLIP(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -43,41 +51,43 @@ class IDCDatasetCLIP(Dataset):
         self.transform = transform
         self.images = []
         self.labels = []
-        
+
         # Load non-IDC images (class 0)
         class0_path = os.path.join(root_dir, '0')
         for img_name in os.listdir(class0_path):
             if img_name.endswith(('.png', '.jpg', '.jpeg')):
                 self.images.append(os.path.join(class0_path, img_name))
                 self.labels.append(0)
-        
+
         # Load IDC images (class 1)
         class1_path = os.path.join(root_dir, '1')
         for img_name in os.listdir(class1_path):
             if img_name.endswith(('.png', '.jpg', '.jpeg')):
                 self.images.append(os.path.join(class1_path, img_name))
                 self.labels.append(1)
-        
+
         print(f"Loaded {len(self.labels)} images")
         print(f"Class 0 (non-IDC): {self.labels.count(0)} images")
         print(f"Class 1 (IDC): {self.labels.count(1)} images")
-    
+
     def __len__(self):
         return len(self.images)
-    
+
     def __getitem__(self, idx):
         try:
             image_path = self.images[idx]
             image = Image.open(image_path).convert('RGB')
             label = self.labels[idx]
-            
+
             if self.transform:
                 image = self.transform(image)
-            
+
             return image, torch.tensor(label, dtype=torch.long)
         except Exception as e:
             print(f"Error loading image {image_path}: {str(e)}")
             return None
+
+
 def save_model_summary(model, input_size=(1, 3, 224, 224)):
     """Save model summary to a text file"""
     try:
@@ -87,6 +97,7 @@ def save_model_summary(model, input_size=(1, 3, 224, 224)):
             print(model_summary, file=f)
     except Exception as e:
         print(f"Warning: Could not save model summary: {str(e)}")
+
 
 def plot_confusion_matrix(cm, classes, epoch, save_dir='plots'):
     """Plot and save confusion matrix"""
@@ -99,6 +110,7 @@ def plot_confusion_matrix(cm, classes, epoch, save_dir='plots'):
     plt.xlabel('Predicted Label')
     plt.savefig(os.path.join(save_dir, f'confusion_matrix_epoch_{epoch}.png'))
     plt.close()
+
 
 def plot_training_metrics(metrics_df, save_dir='plots'):
     """Plot training metrics"""
@@ -145,13 +157,15 @@ def plot_training_metrics(metrics_df, save_dir='plots'):
     plt.close()
 
     # Save numerical metrics to CSV
-    metrics_df.to_csv(os.path.join(save_dir, 'training_metrics.csv'), index=False)
+    metrics_df.to_csv(os.path.join(
+        save_dir, 'training_metrics.csv'), index=False)
+
 
 def initialize_metrics_csv():
     """Initialize CSV file for tracking metrics"""
     os.makedirs('metrics', exist_ok=True)
     filename = os.path.join('metrics',
-                           f'training_metrics_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+                            f'training_metrics_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
     headers = ['epoch', 'train_loss', 'val_loss', 'accuracy', 'precision',
                'recall', 'f1_score', 'learning_rate', 'epoch_time',
                'true_positives', 'false_positives', 'true_negatives',
@@ -161,11 +175,13 @@ def initialize_metrics_csv():
         writer = csv.writer(f)
         writer.writerow(headers)
     return filename
+
+
 def train_model(model, train_loader, val_loader, criterion, optimizer, device, num_epochs=10):
     # Initialize CSV logging
     metrics_filename = initialize_metrics_csv()
     save_model_summary(model)
-    
+
     best_val_loss = float('inf')
     metrics_list = []
 
@@ -187,6 +203,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, n
             labels = labels.to(device)
 
             optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             outputs = model(inputs)
             loss = criterion(outputs, labels)
 
@@ -289,44 +312,50 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, n
     plot_training_metrics(metrics_df)
 
     return metrics_df
+
+
 def main():
     os.makedirs('models', exist_ok=True)
     os.makedirs('metrics3', exist_ok=True)
     os.makedirs('plots3', exist_ok=True)
     # Set random seed
     torch.manual_seed(42)
-    
+
     # Parameters
     BATCH_SIZE = 32
     NUM_EPOCHS = 10
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 1e-2
     VAL_SPLIT = 0.2
-    
+
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     # Load CLIP model
-    clip_model, preprocess = clip.load('ViT-B/32', device=device)
-    
+    print("Loading CLIP model...")
+    clip_model, _ = clip.load('ViT-B/32', device=device, jit=False)
+
+    print("Initializing model...")
+    model = CLIPClassifier(clip_model).to(device)
+
     # Create custom transforms based on CLIP's requirements
     transform = transforms.Compose([
         transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
-                           (0.26862954, 0.26130258, 0.27577711))
+                             (0.26862954, 0.26130258, 0.27577711))
     ])
-    
+
     # Create dataset
     print("Loading dataset...")
     full_dataset = IDCDatasetCLIP('dataset', transform=transform)
-    
+
     # Split dataset
     val_size = int(VAL_SPLIT * len(full_dataset))
     train_size = len(full_dataset) - val_size
     train_dataset, val_dataset = torch.utils.data.random_split(
         full_dataset, [train_size, val_size])
-    
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
@@ -334,34 +363,36 @@ def main():
         shuffle=True,
         num_workers=4
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=4
     )
-    
+
     # Initialize model
     model = CLIPClassifier(clip_model).to(device)
-    
+
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(
+    optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LEARNING_RATE,
         weight_decay=0.01
     )
-    
+
     # Train model
     metrics_list = train_model(
         model, train_loader, val_loader,
-        criterion, optimizer, device, NUM_EPOCHS
+        criterion, optimizer, device, NUM_EPOCHS,
+        scaler=scaler
     )
-    
+
     # Save final model
     torch.save(model.state_dict(), 'final_model_clip.pth')
     print("Training completed. Model saved.")
+
 
 if __name__ == '__main__':
     main()

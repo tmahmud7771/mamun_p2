@@ -1,0 +1,1 @@
+epoch,train_loss,val_loss,accuracy,precision,recall,f1_score,learning_rate,epoch_time,true_positives,false_positives,true_negatives,false_negatives
